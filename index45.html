@@ -3034,8 +3034,15 @@ async function avnSupabaseSignIn(email,password){
   const r=await fetch(AVN_SUPABASE_URL.replace(/\/$/,'')+'/auth/v1/token?grant_type=password',{method:'POST',headers:{'apikey':AVN_SUPABASE_PUBLISHABLE_KEY,'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({email,password})});
   if(!r.ok){
     let detail='';try{detail=await r.text()}catch(e){}
-    if(r.status===400){throw new Error('Supabase Auth rejte email/modpas la. Kont Supabase la egziste, men modpas la pa valide oswa kont lan poko gen yon modpas.')}
-    throw new Error('Auth '+r.status+': '+detail);
+    let authInfo={};try{authInfo=JSON.parse(detail||'{}')}catch(e){}
+    const authCode=String(authInfo.code||authInfo.error_code||'').trim();
+    const authMessage=String(authInfo.msg||authInfo.message||authInfo.error_description||authInfo.error||'').trim();
+    if(r.status===400){
+      const safeCode=authCode?(' ['+authCode+']'):'';
+      const safeMessage=authMessage?(' — '+authMessage):'';
+      throw new Error('Supabase Auth 400'+safeCode+safeMessage+'. Verifye imel/modpas Cloud la ak estati kont lan. Pa gen okenn done ki efase.');
+    }
+    throw new Error('Auth '+r.status+(authCode?' ['+authCode+']':'')+(authMessage?': '+authMessage:'.'));
   }
   avnSupabaseSession=avnNormalizeSupabaseSession(await r.json());if(!avnSupabaseSession)throw new Error('Repons Supabase Auth la pa gen access token.');avnSaveSupabaseSession();return avnSupabaseSession;
 }
@@ -3468,9 +3475,73 @@ async function avnStudentsCloudAudit(){
 
 function avnStudentsCloudStatusBox(){return document.getElementById('avnStudentCloudStatus');}
 
+/* V125 — RÉCUPÉRATION SÉLECTIVE DES PERSONNES DEPUIS LE PAYLOAD CLOUD.
+   Lecture seule du Cloud; ajoute uniquement les fiches absentes localement.
+   Ne lance ni upload, ni sync, ni remplacement global du contenu local. */
+async function avnRecoverMissingPeopleFromCloud(){
+  if(!sessionUser)return alert('Session AVN expirée. Reconnectez-vous.');
+  if(!confirm('Lire le Cloud AVN et ajouter uniquement les élèves/professeurs absents localement ? Les fiches déjà présentes ne seront ni modifiées ni supprimées. Aucun upload Cloud ne sera effectué.'))return false;
+  const status=document.getElementById('avnStudentCloudStatus');
+  if(status)status.textContent='⏳ Lecture sécurisée du Cloud — aucune modification Cloud...';
+  try{
+    if(!(await avnEnsureSupabaseSession()))throw new Error('Connexion Supabase nécessaire.');
+    const r=await fetch(avnSupabaseEndpoint()+'?select=payload,updated_at&project_id=eq.'+encodeURIComponent(AVN_SUPABASE_PROJECT_ID),{headers:avnSupabaseHeaders()});
+    if(!r.ok)throw new Error('Lecture Cloud '+r.status+': '+await r.text());
+    const rows=await r.json();
+    if(!Array.isArray(rows)||!rows.length)throw new Error('Aucune sauvegarde AVN trouvée dans avn_app_state.');
+    const remote=rows[0].payload;
+    if(!remote||typeof remote!=='object'||Array.isArray(remote))throw new Error('Payload Cloud invalide.');
+    const payloadStudents=Array.isArray(remote.students)?remote.students:[];
+    const remoteTeachers=Array.isArray(remote.teachers)?remote.teachers:[];
+    // Les élèves AVN disposent aussi d'une table Cloud dédiée public.students.
+    // Lire les deux sources, puis fusionner par identifiant/NISU sans écraser le local.
+    const cloudStudentRows=await avnStudentsCloudList();
+    const dedicatedStudents=cloudStudentRows.map(avnCloudToLocalStudent);
+    const remoteStudents=[...payloadStudents,...dedicatedStudents];
+    if(!remoteStudents.length&&!remoteTeachers.length)throw new Error('Le Cloud ne contient aucune fiche élève ou professeur dans le payload ni dans la table students. Aucun changement effectué.');
+    const candidate=normalize(JSON.parse(JSON.stringify(db)));
+    const localStudents=Array.isArray(candidate.students)?candidate.students:[];
+    const localTeachers=Array.isArray(candidate.teachers)?candidate.teachers:[];
+    const studentKeys=x=>[x?.id,x?.student_code,x?.studentCode,x?.nisu,x?.ninu,x?.badgeCode].filter(v=>v!==undefined&&v!==null&&String(v).trim()!=='').map(v=>String(v).trim().toLowerCase());
+    const teacherKeys=x=>[x?.id,x?.teacher_code,x?.teacherCode,x?.cin,x?.ninu,x?.email].filter(v=>v!==undefined&&v!==null&&String(v).trim()!=='').map(v=>String(v).trim().toLowerCase());
+    const addMissing=(source,target,keyFn)=>{
+      let added=0,skipped=0;
+      const known=new Set(target.flatMap(keyFn));
+      for(const item of source){
+        if(!item||typeof item!=='object'||Array.isArray(item)){skipped++;continue;}
+        const keys=keyFn(item);
+        // Sans identifiant stable, ne pas deviner: éviter tout doublon ou mauvaise association.
+        if(!keys.length){skipped++;continue;}
+        if(keys.some(k=>known.has(k))){skipped++;continue;}
+        const copy=JSON.parse(JSON.stringify(item));
+        target.push(copy);keys.forEach(k=>known.add(k));added++;
+      }
+      return {added,skipped};
+    };
+    const students=addMissing(remoteStudents,localStudents,studentKeys);
+    const teachers=addMissing(remoteTeachers,localTeachers,teacherKeys);
+    if(!students.added&&!teachers.added){
+      const msg='Vérification terminée : aucune fiche Cloud absente à ajouter.\nCloud: '+remoteStudents.length+' élève(s), '+remoteTeachers.length+' professeur(s).\nLocal: '+localStudents.length+' élève(s), '+localTeachers.length+' professeur(s).\nAucune donnée n’a été modifiée.';
+      if(status)status.textContent=msg;alert(msg);return {students:0,teachers:0};
+    }
+    // Sauvegarde de sécurité avant la modification locale.
+    await avnAutoBackupCreate('Avant récupération sélective des personnes depuis Cloud');
+    try{localStorage.setItem(KEY,JSON.stringify(candidate));}
+    catch(e){throw new Error('Écriture locale impossible; les données actives n’ont pas été remplacées. '+(e.message||''));}
+    db=candidate;
+    try{renderAll();}catch(e){console.error('AVN render après récupération sélective',e);}
+    const msg='✅ Récupération locale terminée.\n\nÉlèves ajoutés: '+students.added+'\nProfesseurs ajoutés: '+teachers.added+'\nÉlèves Cloud examinés: '+remoteStudents.length+'\nProfesseurs Cloud examinés: '+remoteTeachers.length+'\nFiches ignorées (déjà présentes ou sans identifiant): '+(students.skipped+teachers.skipped)+'\n\nLes fiches existantes n’ont pas été modifiées. Le Cloud n’a pas été écrasé et aucun upload n’a été lancé. Vérifiez les listes avant toute synchronisation.';
+    if(status)status.textContent=msg;alert(msg);
+    return {students:students.added,teachers:teachers.added,cloudUpdatedAt:rows[0].updated_at||null};
+  }catch(e){
+    const msg='❌ Récupération interrompue.\n'+(e.message||e)+'\nAucune synchronisation ou suppression n’a été effectuée.';
+    if(status)status.textContent=msg;alert(msg);return false;
+  }
+}
+
 /* Ajout des actions Cloud dans la page Élèves sans modifier les fonctions existantes. */
 const _avnOriginalStudents=students;
-students=function(){_avnOriginalStudents.apply(this,arguments);const bar=document.querySelector('#content-eleves .toolbar');if(bar&&!bar.querySelector('.avn-student-cloud-actions')){const wrap=document.createElement('span');wrap.className='avn-student-cloud-actions';wrap.innerHTML='<button type="button" class="primary" onclick="return avnStudentsCloudTest();">☁️ TEST SUPABASE</button><button type="button" class="primary" onclick="return avnCloudSyncUpload();">⬆️ Sauvegarder tout AVN</button><button type="button" class="secondary" onclick="return avnStudentsCloudUploadAll();">⬆️ Upload élèves</button><button type="button" class="secondary" onclick="return avnStudentsCloudSyncAll();">🔄 Sync complet</button><button type="button" class="secondary" onclick="return avnStudentsCloudDownloadMerge();">⬇️ Fusion Cloud</button><button type="button" class="secondary" onclick="return avnStudentsCloudAudit();">🧪 Audit sync</button><button type="button" class="secondary" onclick="return avnProcessStudentQueue();">📤 Vider la file</button>';bar.appendChild(wrap);}}
+students=function(){_avnOriginalStudents.apply(this,arguments);const bar=document.querySelector('#content-eleves .toolbar');if(bar&&!bar.querySelector('.avn-student-cloud-actions')){const wrap=document.createElement('span');wrap.className='avn-student-cloud-actions';wrap.innerHTML='<button type="button" class="primary" onclick="return avnRecoverMissingPeopleFromCloud();">🛟 Récupérer élèves/professeurs Cloud</button><button type="button" class="primary" onclick="return avnStudentsCloudTest();">☁️ TEST SUPABASE</button><button type="button" class="primary" onclick="return avnCloudSyncUpload();">⬆️ Sauvegarder tout AVN</button><button type="button" class="secondary" onclick="return avnStudentsCloudUploadAll();">⬆️ Upload élèves</button><button type="button" class="secondary" onclick="return avnStudentsCloudSyncAll();">🔄 Sync complet</button><button type="button" class="secondary" onclick="return avnStudentsCloudDownloadMerge();">⬇️ Fusion Cloud</button><button type="button" class="secondary" onclick="return avnStudentsCloudAudit();">🧪 Audit sync</button><button type="button" class="secondary" onclick="return avnProcessStudentQueue();">📤 Vider la file</button>';bar.appendChild(wrap);}}
 
 
 /* === AVN ETAP 14 — PASSWORD RECOVERY V3 — ROBUST SUPABASE RECOVERY === */
@@ -3939,5 +4010,33 @@ avnBulletinDownloadWord=function(){avnArchiveBulletinFromCurrent();return avnV11
 
 /* V113 DOSYE ISTORIK + ACHIV: Tout attitude elèv klase pa moun/klas/ane; dosye konplè montre attitude ak lis tout bulletin yo.
 /* V112 SECURITY: Tout aksyon Attitude (afiche, chanje onglet, konsilte istorik, anrejistre) verifye wòl Administrateur/Direction. Wòl ki pa otorize pa resevwa done attitude nan dosye elèv la. */
+
+/* V126 — bouton de récupération persistant dans la barre Élèves.
+   N'agit que sur l'affichage; la récupération reste déclenchée manuellement. */
+(function avnV126EnsureRecoveryButton(){
+  function ensureButton(){
+    const root=document.getElementById('content-eleves');
+    if(!root) return;
+    const bar=root.querySelector('.toolbar');
+    if(!bar) return;
+    if(bar.querySelector('[data-avn-v126-recovery="1"]')) return;
+    const btn=document.createElement('button');
+    btn.type='button'; btn.className='primary';
+    btn.setAttribute('data-avn-v126-recovery','1');
+    btn.textContent='🛟 Récupérer élèves/professeurs Cloud';
+    btn.addEventListener('click',function(){
+      if(typeof window.avnRecoverMissingPeopleFromCloud==='function') window.avnRecoverMissingPeopleFromCloud();
+      else alert('Fonction de récupération indisponible. Rechargez le fichier AVN.');
+    });
+    bar.insertBefore(btn,bar.firstChild);
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',ensureButton);
+  else ensureButton();
+  const observer=new MutationObserver(ensureButton);
+  observer.observe(document.documentElement,{childList:true,subtree:true});
+  let tries=0;
+  const timer=setInterval(function(){ensureButton();if(++tries>=40)clearInterval(timer);},500);
+})();
+
 </script>
 </body></html>
